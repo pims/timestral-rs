@@ -1,0 +1,6 @@
+/target/
+/models/
+/*.npy
+/forecast.csv
+/output/
+**/__pycache__/

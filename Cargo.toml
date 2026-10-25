@@ -1,0 +1,42 @@
+[package]
+name = "timestral-rs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+default-run = "timestral-rs"
+description = "Exploratory scaffold for Timestral inference with Candle"
+
+[profile.release]
+# Avoid the toolchain's broken rust-objcopy/libLLVM stripping step on this Mac.
+# Release optimization remains enabled; this only retains debug/symbol sections.
+strip = "none"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal"]
+# Force the reference Metal implementation for controlled before/after benchmarks.
+unfused-rmsnorm = []
+# Disable the one-row variable-attention fast path for A/B comparisons.
+full-variate-attention = []
+server = ["dep:axum", "dep:tokio", "dep:tower", "dep:sha2"]
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+required-features = ["server"]
+
+[dependencies]
+anyhow = "1"
+candle-core = "0.11"
+candle-nn = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "net", "time"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+sha2 = { version = "0.10", optional = true }
