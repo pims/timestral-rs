@@ -89,46 +89,75 @@ configuration fixtures are included.
 
 ## Python reference environment
 
-Build the Python dependency image once, from this repository root:
+Use Python 3.12 and Git. From this repository root, create and activate a local
+virtualenv, then install the pinned test dependencies:
 
 ```sh
-docker build --platform linux/arm64 -t timestral-python -f scripts/parity/Dockerfile .
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r tests/python/requirements.txt
 ```
 
-The image contains Python 3.12, CPU PyTorch 2.14.1, NumPy 2.5.4, safetensors 0.8.0,
-and the pinned official Timestral reference. It contains no Rust toolchain or
-project files. Mount the repository and run Python commands directly:
+The requirements pin PyTorch 2.14.1, NumPy 2.5.4, safetensors 0.8.0, and the
+official Timestral reference revision. The `.venv` directory is ignored by Git.
+Run the Python commands below with this environment active.
 
 ```sh
-docker run --rm --platform linux/arm64 -v "$PWD:/work" timestral-python \
-  python3 scripts/test_reference_fixtures.py
+python tests/python ReferenceFixtures
 ```
 
 This runs four Python reference tests covering 23 encoding cases, 28 exact sums,
 22 normalization cases, and the pinned source/version checks. It needs no Rust
-executable or weights. To regenerate fixtures, run
-`python3 scripts/generate_categorical_fixtures.py` in the same container.
-
-To run a different Python test suite, replace the Python command. No wrapper or
-image rebuild is needed when changing mounted scripts. The ARM64 platform matches
-the reference normalization fixtures; x86 hosts need ARM64 emulation.
-
-## Covariate parity
-
-The model repository owns `examples/covariate_forecast.rs`,
-`scripts/compare_covariates.py`, and the fixture generator. Complete Rust/Python
-forecast comparisons require a Rust probe executable on the same OS as the Python
-comparison process. This is separate from the Python-only dependency image.
+executable or weights. To regenerate fixtures:
 
 ```sh
-cargo build --release --features metal --example covariate_forecast --locked
-python3 scripts/compare_covariates.py /path/to/Timestral-5M --device metal
-python3 scripts/compare_covariates.py /path/to/Timestral-28M --device metal
+python tests/fixtures/generate.py
 ```
 
-The comparison accepts `--binary` for an explicit probe path; otherwise Cargo
-metadata locates the build output. Each model must report
-**32 complete-forecast cases passed**.
+Exact normalization fixtures were recorded on ARM64; other CPU architectures may
+produce different float32 reduction results. Python reference forecasts run on
+CPU; `--device metal` selects Metal for the Rust probe.
+
+## Python test suite
+
+Build both native probes, then run all comparisons with one command from this
+repository root and the virtualenv active:
+
+```sh
+cargo build --release --features metal --example covariate_forecast --example batch_forecast --locked
+python tests/python --device metal
+```
+
+The suite runs **82 tests**: four fixture checks, plus 32 covariate tests and seven
+batch tests for each checkpoint. It expects `models/Timestral-5M` and
+`models/Timestral-28M`, and probes in `target/release/examples`. Override their
+locations with `--models-dir` and `--binary-dir`. Use `--device cpu` for CPU tests.
+
+For a Cargo workspace whose models and build output are two directories above:
+
+```sh
+python tests/python --models-dir ../../models --binary-dir ../../target/release/examples --device metal
+```
+
+The suite uses `unittest`. Select a checkpoint's tests or a single test by name:
+
+```sh
+python tests/python --device metal Covariates5M Batch5M
+python tests/python --device metal Covariates5M.test_categorical_missing_unseen
+python tests/python ReferenceFixtures
+```
+
+Covariate tests run the same inputs through Python and Rust, compare all 21
+forecast quantiles, and check first-block intermediates. Category renaming must
+preserve the forecast exactly. Batch tests compare batched Rust forecasts against
+both Python and individual Rust calls, including isolation and output ordering.
+Fixture checks need neither weights nor Rust binaries.
+
+Tolerances are `rtol=1e-4` and
+`atol=2e-4 * max(1, observed target sample std)` per member after context cropping.
+Metal's non-median quantiles use `atol=1e-3 * max(1, std)` to allow accumulated
+float32 differences through nonlinear decoding; medians retain the CPU tolerance.
+Isolation and output ordering checks require exact equality.
 
 ## Native batch validation
 
@@ -143,8 +172,8 @@ TIMESTRAL_CHECKPOINT="$PWD/models/Timestral-28M" cargo test --features metal --t
 Measure latency, throughput, and peak process RSS in separate fresh processes:
 
 ```sh
-python3 examples/benchmark_batch.py models/Timestral-5M --binary target/release/examples/batch_forecast --mode batch
-python3 examples/benchmark_batch.py models/Timestral-5M --binary target/release/examples/batch_forecast --mode individual
+python examples/benchmark_batch.py models/Timestral-5M --binary target/release/examples/batch_forecast --mode batch
+python examples/benchmark_batch.py models/Timestral-5M --binary target/release/examples/batch_forecast --mode individual
 ```
 
 The default workload has 16 targets, 97 observations, and a 65-step horizon. Timing

@@ -1,0 +1,4 @@
+numpy==2.5.4
+safetensors==0.8.0
+torch==2.14.1
+timestral @ git+https://github.com/mistralai/timestral.git@a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff

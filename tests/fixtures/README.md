@@ -10,11 +10,12 @@ Categorical preprocessing fixtures use the official Timestral reference revision
 - `categorical-encoding.json`: 23 encoding cases and 28 exact target-sum cases.
 - `categorical-known-normalization.json`: 22 constant/near-constant normalization cases.
 
-From this model repository, regenerate using the pinned CPU Docker environment:
+From this model repository root, activate the
+[Python reference environment](../../README.md#python-reference-environment) and regenerate:
 
 ```sh
-docker run --rm --platform linux/arm64 -v "$PWD:/work" timestral-python \
-  python3 scripts/generate_categorical_fixtures.py
+source .venv/bin/activate
+python tests/fixtures/generate.py
 cargo test --locked
 ```
 

@@ -32,7 +32,7 @@ to each member. Shorter histories require explicit leading missing values.
 CPU: both checkpoints pass seven Python batch comparisons, native checkpoint
 tests, and the existing 32 covariate comparisons. Isolation and reordering require
 exact equality; numerical tolerances and commands are in the
-[batch validation instructions](../README.md#native-batch-validation).
+[batch validation instructions](../README.md#python-test-suite).
 
 Metal: both checkpoints pass the native batch test and all seven Python batch
 comparisons, confirmed by the contributor on 2026-11-05. Performance measurements
