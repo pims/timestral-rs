@@ -194,23 +194,279 @@ mod tests {
     use super::*;
     use serde::Deserialize;
 
-    #[derive(Deserialize)]
-    struct Fixtures {
-        reference_commit: String,
-        source_sha256: BTreeMap<String, String>,
-        cases: Vec<Case>,
-        reduction_pattern: Vec<Option<f32>>,
-        mean_reductions: Vec<ReductionCase>,
+    fn labels(values: &[&str]) -> Vec<Option<String>> {
+        values.iter().map(|value| Some((*value).into())).collect()
+    }
+
+    #[test]
+    fn categories_use_smoothed_target_means() {
+        let history = [10.0, 20.0, 60.0];
+        let categories = labels(&["a", "a", "b"]);
+
+        let encoded = encode_categorical(&history, None, &categories, None, 3).unwrap();
+
+        // Target mean is 30. Category a: (30 + 10 + 20) / 3 = 20.
+        // Category b: (30 + 60) / 2 = 45.
+        assert_eq!(encoded.history, [20.0, 20.0, 45.0]);
+        assert_eq!(encoded.future, None);
+    }
+
+    #[test]
+    fn unseen_category_uses_target_mean() {
+        let history = [10.0, 30.0];
+        let past = labels(&["a", "b"]);
+        let future = labels(&["unseen"]);
+
+        let encoded = encode_categorical(&history, None, &past, Some(&future), 2).unwrap();
+
+        assert_eq!(encoded.future.unwrap(), [20.0]);
+    }
+
+    #[test]
+    fn missing_labels_form_their_own_category() {
+        let history = [10.0, 30.0];
+        let past = vec![None, Some("observed".into())];
+        let future = vec![None];
+
+        let encoded = encode_categorical(&history, None, &past, Some(&future), 2).unwrap();
+
+        assert_eq!(encoded.history, [15.0, 25.0]);
+        assert_eq!(encoded.future.unwrap(), [15.0]);
+    }
+
+    #[test]
+    fn values_outside_context_do_not_affect_category_means() {
+        let history = [1_000.0, 10.0, 30.0];
+        let past = labels(&["old", "a", "b"]);
+        let future = labels(&["old"]);
+
+        let encoded = encode_categorical(&history, None, &past, Some(&future), 2).unwrap();
+
+        // "old" occurs outside the fitting window, so it uses the fallback.
+        assert_eq!(encoded.future.unwrap(), [20.0]);
+    }
+
+    #[test]
+    fn target_is_forward_filled_before_context_is_cropped() {
+        let history = [10.0, f32::NAN, 30.0];
+        let past = labels(&["a", "a", "b"]);
+        let future = labels(&["unseen"]);
+
+        let encoded = encode_categorical(&history, None, &past, Some(&future), 2).unwrap();
+
+        // The fitting window contains the filled values [10, 30].
+        assert_eq!(encoded.future.unwrap(), [20.0]);
+    }
+
+    #[test]
+    fn leading_missing_targets_do_not_affect_category_means() {
+        let history = [f32::NAN, 10.0, 30.0];
+        let past = labels(&["before_start", "a", "b"]);
+        let future = labels(&["unseen"]);
+
+        let encoded = encode_categorical(&history, None, &past, Some(&future), 3).unwrap();
+
+        assert_eq!(encoded.future.unwrap(), [20.0]);
+    }
+
+    #[test]
+    fn masked_target_values_do_not_affect_category_means() {
+        let history = [10.0, 1_000.0, 30.0];
+        let observed = [true, false, true];
+        let past = labels(&["a", "a", "b"]);
+        let future = labels(&["unseen"]);
+
+        let encoded =
+            encode_categorical(&history, Some(&observed), &past, Some(&future), 3).unwrap();
+
+        // The masked value is forward-filled, giving [10, 10, 30].
+        let expected_mean = 50.0 / 3.0;
+        assert_eq!(encoded.future.unwrap(), [expected_mean]);
+    }
+
+    #[test]
+    fn renaming_categories_preserves_encodings() {
+        let history = [1.0, 3.0, -5.0, 7.0];
+        let past = vec![Some("a".into()), Some("a".into()), None, Some("b".into())];
+        let future = vec![Some("b".into()), None, Some("unseen".into())];
+        let renamed_past = vec![Some("z".into()), Some("z".into()), None, Some("x".into())];
+        let renamed_future = vec![Some("x".into()), None, Some("new".into())];
+
+        let original = encode_categorical(&history, None, &past, Some(&future), 4).unwrap();
+        let renamed =
+            encode_categorical(&history, None, &renamed_past, Some(&renamed_future), 4).unwrap();
+
+        assert_eq!(original.history, renamed.history);
+        assert_eq!(original.future, renamed.future);
+    }
+
+    #[test]
+    fn negating_targets_negates_encodings() {
+        let history = [1.0, 3.0, -5.0, 7.0];
+        let past = vec![Some("a".into()), Some("a".into()), None, Some("b".into())];
+        let future = vec![Some("b".into()), None, Some("unseen".into())];
+        let negated_history = history.map(|value| -value);
+
+        let original = encode_categorical(&history, None, &past, Some(&future), 4).unwrap();
+        let negated = encode_categorical(&negated_history, None, &past, Some(&future), 4).unwrap();
+
+        let expected_history: Vec<f32> = original.history.iter().map(|value| -value).collect();
+        let expected_future: Vec<f32> = original
+            .future
+            .unwrap()
+            .iter()
+            .map(|value| -value)
+            .collect();
+        assert_eq!(negated.history, expected_history);
+        assert_eq!(negated.future.unwrap(), expected_future);
+    }
+
+    #[test]
+    fn future_labels_do_not_change_fitted_statistics() {
+        let history = [1.0, 2.0, 3.0];
+        let past = labels(&["a", "b", "a"]);
+        let short_future = labels(&["a", "unseen"]);
+        let mut long_future = short_future.clone();
+        long_future.extend([Some("future_only".into()), None, Some("b".into())]);
+
+        let short = encode_categorical(&history, None, &past, Some(&short_future), 3).unwrap();
+        let long = encode_categorical(&history, None, &past, Some(&long_future), 3).unwrap();
+
+        assert_eq!(short.history, long.history);
+        assert_eq!(short.future.unwrap(), long.future.unwrap()[..2]);
+    }
+
+    #[test]
+    fn rejects_invalid_inputs() {
+        let past = labels(&["a"]);
+        let cases = [
+            (
+                "empty target history",
+                encode_categorical(&[], None, &[], None, 1),
+                "nonempty target history",
+            ),
+            (
+                "zero context length",
+                encode_categorical(&[1.0], None, &past, None, 0),
+                "max_context must be positive",
+            ),
+            (
+                "misaligned categorical history",
+                encode_categorical(&[1.0, 2.0], None, &past, None, 2),
+                "Categorical history length",
+            ),
+            (
+                "misaligned target mask",
+                encode_categorical(&[1.0], Some(&[]), &past, None, 1),
+                "Observation mask length",
+            ),
+        ];
+
+        for (name, result, expected_error) in cases {
+            let error = result.expect_err(name);
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_utf8_label_boundaries() {
+        let at_limit = "é".repeat(128); // 256 bytes.
+        let oversized = "é".repeat(129); // 258 bytes, despite only 129 characters.
+        let cases = [
+            ("historical label at limit", at_limit.as_str(), None, true),
+            (
+                "oversized historical label",
+                oversized.as_str(),
+                None,
+                false,
+            ),
+            ("future label at limit", "a", Some(at_limit.as_str()), true),
+            (
+                "oversized future label",
+                "a",
+                Some(oversized.as_str()),
+                false,
+            ),
+        ];
+
+        for (name, historical_label, future_label, valid) in cases {
+            let past = labels(&[historical_label]);
+            let future = future_label.map(|label| labels(&[label]));
+
+            let result = encode_categorical(&[1.0], None, &past, future.as_deref(), 1);
+
+            if valid {
+                let encoded = result.expect(name);
+                assert_eq!(encoded.history, [1.0], "{name}");
+                assert_eq!(encoded.future, future_label.map(|_| vec![1.0]), "{name}");
+            } else {
+                let error = result.expect_err(name);
+                assert!(
+                    error.to_string().contains("Category labels"),
+                    "{name}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validates_distinct_category_boundaries() {
+        let limit = MAX_CATEGORIES_PER_COVARIATE;
+        let cases = [
+            ("at historical limit", limit, vec![], true),
+            ("too many historical categories", limit + 1, vec![], false),
+            (
+                "future label exceeds limit",
+                limit,
+                vec![Some("extra".into())],
+                false,
+            ),
+            ("missing label does not count", limit, vec![None], true),
+        ];
+
+        for (name, historical_count, future, valid) in cases {
+            let past: Vec<_> = (0..historical_count)
+                .map(|index| Some(index.to_string()))
+                .collect();
+            let history = vec![1.0; historical_count];
+
+            let result = encode_categorical(&history, None, &past, Some(&future), history.len());
+
+            if valid {
+                let encoded = result.expect(name);
+                assert_eq!(encoded.history, history, "{name}");
+                assert_eq!(encoded.future.unwrap(), vec![1.0; future.len()], "{name}");
+            } else {
+                let error = result.expect_err(name);
+                assert!(
+                    error.to_string().contains("Distinct category labels"),
+                    "{name}: {error}"
+                );
+            }
+        }
     }
 
     #[derive(Deserialize)]
-    struct ReductionCase {
+    struct PythonFixtures {
+        reference_commit: String,
+        source_sha256: BTreeMap<String, String>,
+        cases: Vec<EncodingCase>,
+        reduction_pattern: Vec<Option<f32>>,
+        mean_reductions: Vec<SumCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct SumCase {
         length: usize,
         expected_sum_bits: String,
     }
 
     #[derive(Deserialize)]
-    struct Case {
+    struct EncodingCase {
         name: String,
         history: Vec<Option<f32>>,
         observation_mask: Option<Vec<bool>>,
@@ -222,22 +478,8 @@ mod tests {
         encoded_future: Option<Vec<Option<f32>>>,
     }
 
-    fn compare(name: &str, actual: &[f32], expected: &[Option<f32>]) {
-        assert_eq!(actual.len(), expected.len(), "{name}");
-        for (i, (&actual, expected)) in actual.iter().zip(expected).enumerate() {
-            match expected {
-                None => assert!(actual.is_nan(), "{name}[{i}]: expected NaN, got {actual}"),
-                Some(expected) => assert!(
-                    (actual - expected).abs() <= 1e-6 * expected.abs().max(1.0),
-                    "{name}[{i}]: {actual} != {expected}"
-                ),
-            }
-        }
-    }
-
-    #[test]
-    fn matches_pinned_python_preprocessing() {
-        let fixtures: Fixtures =
+    fn python_fixtures() -> PythonFixtures {
+        let fixtures: PythonFixtures =
             serde_json::from_str(include_str!("../tests/fixtures/categorical-encoding.json"))
                 .unwrap();
         assert_eq!(
@@ -246,115 +488,103 @@ mod tests {
         );
         assert_eq!(fixtures.source_sha256.len(), 2);
         assert!(fixtures.source_sha256.values().all(|hash| hash.len() == 64));
-        assert_eq!(fixtures.cases.len(), 23);
-        assert_eq!(fixtures.mean_reductions.len(), 28);
-        for case in fixtures.mean_reductions {
-            let target: Vec<f32> = (0..case.length)
-                .map(|i| {
-                    fixtures.reduction_pattern[i % fixtures.reduction_pattern.len()]
-                        .unwrap_or(f32::NAN)
-                })
-                .collect();
-            assert_eq!(
-                numpy_target_sum(&target),
-                f64::from_bits(u64::from_str_radix(&case.expected_sum_bits, 16).unwrap()),
-                "NumPy float64 sum for length {}",
-                case.length
-            );
-        }
-        for case in fixtures.cases {
-            let history: Vec<f32> = case.history.iter().map(|v| v.unwrap_or(f32::NAN)).collect();
-            let mask = case.observation_mask.as_deref();
-            compare(
-                &case.name,
-                &encoding_target(&history, mask, case.max_context),
-                &case.encoding_target,
-            );
-            let actual = encode_categorical(
-                &history,
-                mask,
-                &case.past,
-                case.future.as_deref(),
-                case.max_context,
-            )
-            .unwrap();
-            compare(&case.name, &actual.history, &case.encoded_past);
-            assert_eq!(actual.future.is_some(), case.encoded_future.is_some());
-            if let (Some(actual), Some(expected)) = (actual.future, case.encoded_future) {
-                compare(&case.name, &actual, &expected);
+        assert!(!fixtures.cases.is_empty(), "Missing Python encoding cases");
+        assert!(
+            !fixtures.reduction_pattern.is_empty(),
+            "Missing reduction pattern"
+        );
+        assert!(
+            !fixtures.mean_reductions.is_empty(),
+            "Missing NumPy sum cases"
+        );
+        fixtures
+    }
+
+    fn assert_matches_fixture(case: &str, stage: &str, actual: &[f32], expected: &[Option<f32>]) {
+        assert_eq!(actual.len(), expected.len(), "{case}/{stage}: length");
+        for (index, (&actual, expected)) in actual.iter().zip(expected).enumerate() {
+            match expected {
+                None => assert!(
+                    actual.is_nan(),
+                    "{case}/{stage}[{index}]: expected NaN, got {actual}"
+                ),
+                Some(expected) => {
+                    // Preserve the reference fixture tolerance: 1e-6 in target units,
+                    // scaled by magnitude above one. Missing masks must match exactly.
+                    let tolerance = 1e-6 * expected.abs().max(1.0);
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "{case}/{stage}[{index}]: {actual} != {expected}"
+                    );
+                }
             }
         }
     }
 
-    fn labels(values: &[Option<&str>]) -> Vec<Option<String>> {
-        values.iter().map(|v| v.map(str::to_owned)).collect()
-    }
-
     #[test]
-    fn renaming_reflection_and_request_isolation() {
-        let past = labels(&[Some("a"), Some("a"), None, Some("b")]);
-        let future = labels(&[Some("b"), None, Some("new")]);
-        let target = [1.0, 3.0, -5.0, 7.0];
-        let original = encode_categorical(&target, None, &past, Some(&future), 4).unwrap();
-        let renamed_past = labels(&[Some("z"), Some("z"), None, Some("x")]);
-        let renamed_future = labels(&[Some("x"), None, Some("unseen")]);
-        let renamed =
-            encode_categorical(&target, None, &renamed_past, Some(&renamed_future), 4).unwrap();
-        assert_eq!(original.history, renamed.history);
-        assert_eq!(original.future, renamed.future);
-        let mirrored =
-            encode_categorical(&target.map(|v| -v), None, &past, Some(&future), 4).unwrap();
-        for (a, b) in original.history.iter().zip(mirrored.history) {
-            assert_eq!(*a, -b);
+    fn target_sums_match_numpy_fixtures() {
+        let fixtures = python_fixtures();
+
+        for case in fixtures.mean_reductions {
+            let target: Vec<f32> = fixtures
+                .reduction_pattern
+                .iter()
+                .cycle()
+                .take(case.length)
+                .map(|value| value.unwrap_or(f32::NAN))
+                .collect();
+            let expected_sum =
+                f64::from_bits(u64::from_str_radix(&case.expected_sum_bits, 16).unwrap());
+
+            let actual_sum = numpy_target_sum(&target);
+
+            assert_eq!(
+                actual_sum, expected_sum,
+                "NumPy float64 sum for length {}",
+                case.length
+            );
         }
-        for (a, b) in original
-            .future
-            .as_ref()
-            .unwrap()
-            .iter()
-            .zip(mirrored.future.unwrap())
-        {
-            assert_eq!(*a, -b);
+    }
+
+    #[test]
+    fn encodings_match_python_fixtures() {
+        let fixtures = python_fixtures();
+
+        for case in fixtures.cases {
+            let history: Vec<f32> = case
+                .history
+                .iter()
+                .map(|value| value.unwrap_or(f32::NAN))
+                .collect();
+
+            let encoded = encode_categorical(
+                &history,
+                case.observation_mask.as_deref(),
+                &case.past,
+                case.future.as_deref(),
+                case.max_context,
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+
+            let fitting_target =
+                encoding_target(&history, case.observation_mask.as_deref(), case.max_context);
+            assert_matches_fixture(
+                &case.name,
+                "fitting_target",
+                &fitting_target,
+                &case.encoding_target,
+            );
+            assert_matches_fixture(&case.name, "history", &encoded.history, &case.encoded_past);
+            match (&encoded.future, &case.encoded_future) {
+                (Some(actual), Some(expected)) => {
+                    assert_matches_fixture(&case.name, "future", actual, expected)
+                }
+                (None, None) => {}
+                _ => panic!(
+                    "{}: future output presence differs from reference",
+                    case.name
+                ),
+            }
         }
-        // A different request must not mutate a mapping used by this request.
-        encode_categorical(&[100.0; 4], None, &past, Some(&future), 4).unwrap();
-        let repeated = encode_categorical(&target, None, &past, Some(&future), 4).unwrap();
-        assert_eq!(original.history, repeated.history);
-        assert_eq!(original.future, repeated.future);
-    }
-
-    #[test]
-    fn future_labels_cannot_change_fitted_statistics() {
-        let past = labels(&[Some("a"), Some("b"), Some("a")]);
-        let short = labels(&[Some("a"), Some("new")]);
-        let mut long = short.clone();
-        long.extend(labels(&[Some("future_only"), None, Some("b")]));
-        let first = encode_categorical(&[1.0, 2.0, 3.0], None, &past, Some(&short), 3).unwrap();
-        let second = encode_categorical(&[1.0, 2.0, 3.0], None, &past, Some(&long), 3).unwrap();
-        assert_eq!(first.history, second.history);
-        assert_eq!(first.future.unwrap(), second.future.unwrap()[..2]);
-    }
-
-    #[test]
-    fn rejects_misalignment_and_resource_violations() {
-        let past = labels(&[Some("a")]);
-        assert!(encode_categorical(&[], None, &[], None, 1).is_err());
-        assert!(encode_categorical(&[1.0], None, &past, None, 0).is_err());
-        assert!(encode_categorical(&[1.0, 2.0], None, &past, None, 2).is_err());
-        assert!(encode_categorical(&[1.0], Some(&[]), &past, None, 1).is_err());
-        let oversized = vec![Some("é".repeat(129))];
-        assert!(encode_categorical(&[1.0], None, &oversized, None, 1).is_err());
-        assert!(encode_categorical(&[1.0], None, &past, Some(&oversized), 1).is_err());
-        let boundary = vec![Some("é".repeat(128))];
-        assert!(encode_categorical(&[1.0], None, &boundary, None, 1).is_ok());
-        let many: Vec<_> = (0..MAX_CATEGORIES_PER_COVARIATE)
-            .map(|i| Some(i.to_string()))
-            .collect();
-        let target = vec![1.0; many.len()];
-        assert!(encode_categorical(&target, None, &many, None, many.len()).is_ok());
-        let extra = labels(&[Some("extra")]);
-        assert!(encode_categorical(&target, None, &many, Some(&extra), many.len()).is_err());
-        // The missing bucket is separate from the non-null category bound.
-        assert!(encode_categorical(&target, None, &many, Some(&[None]), many.len()).is_ok());
     }
 }
