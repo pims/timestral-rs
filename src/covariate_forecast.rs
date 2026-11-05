@@ -1,6 +1,7 @@
-//! One target plus numeric covariates. Preparation/statistics run on CPU; the
+//! One target plus numeric and categorical covariates. Preparation/statistics run on CPU; the
 //! existing Candle transformer runs on the model's selected device.
 use crate::{
+    categorical::encode_categorical,
     covariates::{CovariateAttention, Covariates},
     forecaster::{prepare_history, Forecast, ForecastOptions, TimestralForecaster},
     masks::{covariate_masks, RowRole},
@@ -48,7 +49,7 @@ impl TimestralForecaster {
         };
         ensure!(
             layout.elements(
-                1 + covariates.past.len() + covariates.known.len(),
+                1 + covariates.past_count() + covariates.known_count(),
                 history.len(),
                 horizon,
                 max_context
@@ -69,6 +70,33 @@ impl TimestralForecaster {
             .min(c.block_size)
             .min(options.per_shot_horizon_patches);
         let mut trace = BTreeMap::new();
+        // Export the uncropped encodings as well as model stages so parity checks
+        // catch fitting-window and missing-label errors hidden by later padding.
+        for (name, labels) in &covariates.categorical_past {
+            let encoded = encode_categorical(history, Some(&observed), labels, None, max_context)?;
+            trace.insert(
+                format!("categorical_past:{name}:history"),
+                Tensor::from_vec(encoded.history, history.len(), &Device::Cpu)?,
+            );
+        }
+        for (name, labels) in &covariates.categorical_known {
+            let encoded = encode_categorical(
+                history,
+                Some(&observed),
+                &labels.history,
+                Some(&labels.future),
+                max_context,
+            )?;
+            trace.insert(
+                format!("categorical_known:{name}:history"),
+                Tensor::from_vec(encoded.history, history.len(), &Device::Cpu)?,
+            );
+            trace.insert(
+                format!("categorical_known:{name}:future"),
+                Tensor::from_vec(encoded.future.expect("known labels"), horizon, &Device::Cpu)?,
+            );
+        }
+
         let anchor = self
             .model
             .predict_covariate_block(&rows, 0, block, Some(&mut trace))?;
@@ -92,8 +120,10 @@ impl TimestralForecaster {
         Ok(trace)
     }
 
-    /// Forecast one target with aligned numeric exogenous rows. Missing values
-    /// are NaN; known rows supply exactly `horizon` future values. Only target
+    /// Forecast one target with aligned numeric or categorical exogenous rows. Missing values
+    /// are NaN; categorical rows use string/null labels. Known rows supply
+    /// exactly `horizon` future values. Categories are fit once using the
+    /// masked historical target and effective `max_context`. Only target
     /// quantiles are returned, with the same shape as `forecast_masked`.
     pub fn forecast_with_covariates(
         &self,
@@ -140,8 +170,8 @@ impl TimestralForecaster {
             "Invalid forecast options"
         );
         let count = 1usize
-            .checked_add(covariates.past.len())
-            .and_then(|n| n.checked_add(covariates.known.len()))
+            .checked_add(covariates.past_count())
+            .and_then(|n| n.checked_add(covariates.known_count()))
             .ok_or_else(|| anyhow::anyhow!("Row count overflow"))?;
         let layout = CovariateAttention {
             patch_size: c.patch_size,
@@ -450,24 +480,19 @@ fn scale_known(
     let loc = if binary {
         0.0
     } else {
-        values
-            .iter()
-            .zip(observed)
-            .filter(|(_, obs)| **obs)
-            .map(|(v, _)| f64::from(*v))
-            .sum::<f64>() as f32
+        reference_f32_sum(values.len(), |i| if observed[i] { values[i] } else { 0.0 })
             / count.max(1) as f32
     };
     let scale = if binary {
         1.0
     } else {
-        (values
-            .iter()
-            .zip(observed)
-            .filter(|(_, obs)| **obs)
-            .map(|(v, _)| f64::from((*v - loc).powi(2)))
-            .sum::<f64>() as f32
-            / count.max(1) as f32)
+        (reference_f32_sum(values.len(), |i| {
+            if observed[i] {
+                (values[i] - loc).powi(2)
+            } else {
+                0.0
+            }
+        }) / count.max(1) as f32)
             .sqrt()
             .max(minimum)
     };
@@ -492,6 +517,67 @@ fn scale_known(
         loc: vec![loc; values.len()],
         scale: vec![scale; values.len()],
     }
+}
+
+/// Fixed F32 cascade reduction matching the pinned Python CPU reference's
+/// four-lane contiguous sum. Keep masked slots (zero weights) in their original
+/// positions: filtering them changes rounding. In nearly constant encoded rows,
+/// a one-ULP mean difference can otherwise dominate the normalized features.
+/// Order follows PyTorch v2.14.1 aten/src/ATen/native/cpu/SumKernel.cpp.
+/// Use this same portable order on every Rust backend; do not depend on the host SIMD width.
+fn reference_f32_sum(length: usize, value: impl Fn(usize) -> f32) -> f32 {
+    let lanes = if length >= 4 { 4 } else { 1 };
+    let vectors = length / lanes;
+    let groups = vectors / 4;
+    let power = ((usize::BITS - groups.saturating_sub(1).leading_zeros()) / 4).max(4);
+    let step = 1usize << power;
+    let mut sums = [[[0.0f32; 4]; 4]; 4];
+    for group in 0..groups {
+        for partial in 0..4 {
+            for lane in 0..lanes {
+                sums[0][partial][lane] += value((group * 4 + partial) * lanes + lane);
+            }
+        }
+        let completed = group + 1;
+        if completed % step == 0 {
+            for level in 1..4 {
+                for partial in 0..4 {
+                    for lane in 0..lanes {
+                        sums[level][partial][lane] += sums[level - 1][partial][lane];
+                        sums[level - 1][partial][lane] = 0.0;
+                    }
+                }
+                if completed & ((step - 1) << (level as u32 * power)) != 0 {
+                    break;
+                }
+            }
+        }
+    }
+    for level in 1..4 {
+        for partial in 0..4 {
+            for lane in 0..lanes {
+                sums[0][partial][lane] += sums[level][partial][lane];
+            }
+        }
+    }
+    for vector in groups * 4..vectors {
+        for lane in 0..lanes {
+            sums[0][0][lane] += value(vector * lanes + lane);
+        }
+    }
+    for partial in 1..4 {
+        for lane in 0..lanes {
+            sums[0][0][lane] += sums[0][partial][lane];
+        }
+    }
+    let mut total = 0.0f32;
+    for i in vectors * lanes..length {
+        total += value(i);
+    }
+    for lane in 0..lanes {
+        total += sums[0][0][lane];
+    }
+    total
 }
 
 fn prepare_rows(
@@ -550,10 +636,31 @@ fn prepare_rows(
     for values in covariates.past.values() {
         rows.push(prepare(values, None, RowRole::Past)?);
     }
+    // Match the reference packing: target, numeric past, categorical past,
+    // numeric known, categorical known. Encoding is done once before decoding,
+    // using the original target mask and context limit for every future block.
+    for labels in covariates.categorical_past.values() {
+        let encoded = encode_categorical(history, Some(observed), labels, None, max_context)?;
+        rows.push(prepare(&encoded.history, None, RowRole::Past)?);
+    }
     for values in covariates.known.values() {
         rows.push(prepare(
             &values.history,
             Some(&values.future),
+            RowRole::Known,
+        )?);
+    }
+    for labels in covariates.categorical_known.values() {
+        let encoded = encode_categorical(
+            history,
+            Some(observed),
+            &labels.history,
+            Some(&labels.future),
+            max_context,
+        )?;
+        rows.push(prepare(
+            &encoded.history,
+            encoded.future.as_deref(),
             RowRole::Known,
         )?);
     }
@@ -563,6 +670,63 @@ fn prepare_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn known_normalization_matches_python_for_nearly_constant_encoded_rows() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            length: usize,
+            constant: bool,
+            mean: f32,
+            scale: f32,
+            sum: f32,
+            normalized_prefix: Vec<f32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixtures {
+            cases: Vec<Case>,
+        }
+        let fixture: Fixtures = serde_json::from_str(include_str!(
+            "../tests/fixtures/categorical-known-normalization.json"
+        ))
+        .unwrap();
+        for case in fixture.cases {
+            let values: Vec<f32> = (0..case.length)
+                .map(|i| {
+                    (104.45187f64
+                        + if case.constant {
+                            0.0
+                        } else {
+                            (i % 17) as f64 * 0.001
+                        }) as f32
+                })
+                .collect();
+            let observed: Vec<bool> = (0..case.length).map(|i| i % 7 != 0).collect();
+            let sum = reference_f32_sum(case.length, |i| if observed[i] { values[i] } else { 0.0 });
+            assert_eq!(
+                sum, case.sum,
+                "sum for {} constant={}",
+                case.length, case.constant
+            );
+            let actual = scale_known(&values, &observed, 1e-6, true);
+            assert_eq!(
+                actual.loc[0], case.mean,
+                "mean for {} constant={}",
+                case.length, case.constant
+            );
+            assert_eq!(
+                actual.scale[0], case.scale,
+                "scale for {} constant={}",
+                case.length, case.constant
+            );
+            for (actual, expected) in actual.values.iter().zip(&case.normalized_prefix) {
+                assert!(
+                    (actual - expected).abs() < 2e-6,
+                    "normalized {actual} != {expected}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn known_normalization_preserves_binary_values_and_uses_population_variance() {
         let binary = scale_known(

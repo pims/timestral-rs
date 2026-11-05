@@ -1,7 +1,8 @@
-//! Numeric covariate inputs, validation, and allocation bounds.
+//! Numeric and categorical covariate inputs, validation, and allocation bounds.
+use crate::categorical::validate_categorical_labels;
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const DEFAULT_ATTENTION_ELEMENTS: usize = 8_388_608;
 /// Initial validated CPU release; matches the existing VPS forecast limit.
@@ -56,12 +57,14 @@ impl CovariateAttention {
     }
 }
 
-/// Aligned float32 rows in stable name order. NaN retains an explicit null mask;
-/// no forward-filling, scaling, padding, or categorical encoding happens here.
+/// Aligned numeric and categorical rows in stable name order. Numeric NaNs
+/// retain explicit missing masks. Categorical encoding happens in forecast preparation.
 #[derive(Clone, Debug, Default)]
 pub struct Covariates {
     pub past: BTreeMap<String, Vec<f32>>,
     pub known: BTreeMap<String, KnownCovariate>,
+    pub categorical_past: BTreeMap<String, Vec<Option<String>>>,
+    pub categorical_known: BTreeMap<String, KnownCategoricalCovariate>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,9 +73,23 @@ pub struct KnownCovariate {
     pub future: Vec<f32>,
 }
 
+#[derive(Clone, Debug)]
+pub struct KnownCategoricalCovariate {
+    pub history: Vec<Option<String>>,
+    pub future: Vec<Option<String>>,
+}
+
 impl Covariates {
+    pub fn past_count(&self) -> usize {
+        self.past.len() + self.categorical_past.len()
+    }
+
+    pub fn known_count(&self) -> usize {
+        self.known.len() + self.categorical_known.len()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.past.is_empty() && self.known.is_empty()
+        self.past_count() == 0 && self.known_count() == 0
     }
 }
 
@@ -118,22 +135,29 @@ impl Covariates {
         max_input_values: usize,
     ) -> Result<()> {
         validate_covariate_limits(
-            self.past.len(),
-            self.known.len(),
+            self.past_count(),
+            self.known_count(),
             history_len,
             horizon,
             max_covariates,
             max_input_values,
         )?;
-        for name in self.past.keys().chain(self.known.keys()) {
+        let mut names = BTreeSet::new();
+        for name in self
+            .past
+            .keys()
+            .chain(self.known.keys())
+            .chain(self.categorical_past.keys())
+            .chain(self.categorical_known.keys())
+        {
+            ensure!(
+                names.insert(name),
+                "Covariate names must be unique across all numeric and categorical inputs"
+            );
             ensure!(!name.is_empty() && name.len() <= 64 && name.trim() == name
                 && !name.chars().any(char::is_control),
                 "Covariate names must be 1..=64 UTF-8 bytes, without control characters or surrounding whitespace");
         }
-        ensure!(
-            !self.past.keys().any(|name| self.known.contains_key(name)),
-            "Covariate names must be unique across past and known inputs"
-        );
         for values in self.past.values() {
             ensure!(
                 values.len() == history_len,
@@ -161,6 +185,24 @@ impl Covariates {
                     .all(|v| !v.is_infinite()),
                 "Covariate values must be finite or NaN for missing data"
             );
+        }
+        for values in self.categorical_past.values() {
+            ensure!(
+                values.len() == history_len,
+                "Categorical past covariate length must match history length"
+            );
+            validate_categorical_labels(values, None)?;
+        }
+        for values in self.categorical_known.values() {
+            ensure!(
+                values.history.len() == history_len,
+                "Categorical known covariate history length must match history length"
+            );
+            ensure!(
+                values.future.len() == horizon,
+                "Categorical known covariate future length must equal horizon"
+            );
+            validate_categorical_labels(&values.history, Some(&values.future))?;
         }
         Ok(())
     }
