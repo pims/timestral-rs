@@ -6,12 +6,13 @@ Last updated: **2026-11-05**
 Track missing features relative to the
 [Python reference (`a534bdbd`)](https://github.com/mistralai/timestral/tree/a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff).
 
-Rust supports one target with numeric or categorical covariates on CPU and Metal
-(float32). Covariate forecasts are limited to 256 steps.
+Rust supports single-target forecasts and batches of independent targets with
+numeric or categorical covariates on CPU and Metal (float32). Covariate forecasts
+are limited to 256 steps.
 
 ## Improvements
 
-- [ ] [MODEL-001: Batch independent series](MODEL-001.md)
+- [x] [MODEL-001: Batch independent series](MODEL-001.md)
 - [ ] [MODEL-002: Forecast related targets jointly](MODEL-002.md)
 - [ ] [MODEL-003: Extend covariate forecast horizons](MODEL-003.md)
 - [ ] [MODEL-004: Accept numeric categorical codes](MODEL-004.md)

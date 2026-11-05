@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{model::TimestralModel, scaler};
 
 pub struct Forecast {
-    /// [1, 1, horizon, quantile_levels], on the model's selected device.
+    /// [batch, 1, horizon, quantile_levels] (batch is 1 for single-series calls), on the model's selected device.
     pub quantiles: Tensor,
     pub quantile_levels: Vec<f64>,
 }

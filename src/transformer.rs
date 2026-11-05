@@ -135,21 +135,27 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         mut trace: Option<&mut BlockTrace>,
+        rows_per_group: usize,
     ) -> Result<Tensor> {
         // With one row and no variable mask, every attention head has one key:
         // softmax([score]) = [1], so the attention output is exactly its V.
         // Explicit masks (including fully masked queries) retain the general path.
-        if !self.is_time && x.dim(0)? == 1 && allowed.is_none() {
+        if !self.is_time && rows_per_group == 1 && allowed.is_none() {
             if let Some(value) = &self.singleton_value {
                 return self.forward_singleton(x, value, trace);
             }
         }
         // Variable attention treats patches as batches and rows as the sequence.
         // RoPE is applied only to time attention.
+        let (rows, patches, width) = x.dims3()?;
+        let groups = rows / rows_per_group;
         let inputs = if self.is_time {
             x.clone()
         } else {
-            x.transpose(0, 1)?.contiguous()?
+            x.reshape((groups, rows_per_group, patches, width))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((groups * patches, rows_per_group, width))?
         };
         let (batch, sequence, _) = inputs.dims3()?;
         let fused = self.qkv.forward(&inputs.contiguous()?)?.reshape((
@@ -222,7 +228,11 @@ impl Attention {
         let restored = if self.is_time {
             gated
         } else {
-            gated.transpose(0, 1)?.contiguous()?
+            gated
+                .reshape((groups, patches, rows_per_group, width))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((rows, patches, width))?
         };
         let projected = self.output_projection.forward(&restored)?;
         record(&mut trace, "attn_projected", &projected);
@@ -306,6 +316,12 @@ fn value_only_projection(
     Ok(Linear::new(weight, bias))
 }
 
+struct AttentionMasks<'a> {
+    time: &'a Tensor,
+    variable: Option<&'a Tensor>,
+    rows_per_group: usize,
+}
+
 /// One scheduled layer: attention sublayers in order, followed by a shared MLP.
 struct TransformerBlock {
     attentions: Vec<(RmsNorm, Attention)>,
@@ -353,8 +369,7 @@ impl TransformerBlock {
     fn forward(
         &self,
         x: &Tensor,
-        time_mask: &Tensor,
-        variable_mask: Option<&Tensor>,
+        masks: &AttentionMasks<'_>,
         cos: &Tensor,
         sin: &Tensor,
         mut trace: Option<&mut BlockTrace>,
@@ -365,11 +380,18 @@ impl TransformerBlock {
             let mut subtrace = trace.as_ref().map(|_| BlockTrace::new());
             record(&mut subtrace.as_mut(), "attn_norm", &normalized);
             let mask = if attention.is_time {
-                Some(time_mask)
+                Some(masks.time)
             } else {
-                variable_mask
+                masks.variable
             };
-            let projected = attention.forward(&normalized, mask, cos, sin, subtrace.as_mut())?;
+            let projected = attention.forward(
+                &normalized,
+                mask,
+                cos,
+                sin,
+                subtrace.as_mut(),
+                masks.rows_per_group,
+            )?;
             x = x.add(&projected)?;
             record(&mut subtrace.as_mut(), "attn_residual", &x);
             if let (Some(destination), Some(subtrace)) = (trace.as_deref_mut(), subtrace) {
@@ -437,7 +459,7 @@ impl Transformer {
         time_mask: &Tensor,
         variable_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        self.run(x, positions, time_mask, variable_mask, None)
+        self.run(x, positions, time_mask, variable_mask, None, None)
     }
 
     pub fn forward_trace(
@@ -448,8 +470,33 @@ impl Transformer {
         variable_mask: Option<&Tensor>,
     ) -> Result<BlockTrace> {
         let mut trace = BlockTrace::new();
-        self.run(x, positions, time_mask, variable_mask, Some(&mut trace))?;
+        self.run(
+            x,
+            positions,
+            time_mask,
+            variable_mask,
+            Some(&mut trace),
+            None,
+        )?;
         Ok(trace)
+    }
+
+    pub(crate) fn forward_grouped(
+        &self,
+        x: &Tensor,
+        positions: &Tensor,
+        time_mask: &Tensor,
+        variable_mask: Option<&Tensor>,
+        rows_per_group: usize,
+    ) -> Result<Tensor> {
+        self.run(
+            x,
+            positions,
+            time_mask,
+            variable_mask,
+            None,
+            Some(rows_per_group),
+        )
     }
 
     fn run(
@@ -459,22 +506,26 @@ impl Transformer {
         time_mask: &Tensor,
         variable_mask: Option<&Tensor>,
         mut trace: Option<&mut BlockTrace>,
+        rows_per_group: Option<usize>,
     ) -> Result<Tensor> {
         validate_inputs(x, positions, self.width)?;
+        let rows_per_group = rows_per_group.unwrap_or(x.dim(0)?);
+        ensure!(
+            rows_per_group > 0 && x.dim(0)?.is_multiple_of(rows_per_group),
+            "Invalid independent group shape"
+        );
+        let masks = AttentionMasks {
+            time: time_mask,
+            variable: variable_mask,
+            rows_per_group,
+        };
         let (cos, sin) = self.rope.tables(positions, x.device())?;
         record(&mut trace, "cos", &cos);
         record(&mut trace, "sin", &sin);
         let mut x = x.clone();
         for (i, block) in self.blocks.iter().enumerate() {
             let mut block_trace = trace.as_ref().map(|_| BlockTrace::new());
-            x = block.forward(
-                &x,
-                time_mask,
-                variable_mask,
-                &cos,
-                &sin,
-                block_trace.as_mut(),
-            )?;
+            x = block.forward(&x, &masks, &cos, &sin, block_trace.as_mut())?;
             if let (Some(destination), Some(block_trace)) = (trace.as_deref_mut(), block_trace) {
                 destination.extend(
                     block_trace
@@ -519,8 +570,17 @@ impl TimeTransformerBlock {
         validate_inputs(x, positions, self.width)?;
         let (cos, sin) = self.rope.tables(positions, x.device())?;
         let mut trace = BlockTrace::new();
-        self.block
-            .forward(x, allowed, None, &cos, &sin, Some(&mut trace))?;
+        self.block.forward(
+            x,
+            &AttentionMasks {
+                time: allowed,
+                variable: None,
+                rows_per_group: x.dim(0)?,
+            },
+            &cos,
+            &sin,
+            Some(&mut trace),
+        )?;
         let mut trace: BlockTrace = trace
             .into_iter()
             .map(|(name, value)| {
@@ -632,7 +692,7 @@ mod singleton_tests {
         };
         let tables = Tensor::zeros((1, 2, 2), DType::F32, &Device::Cpu).unwrap();
         let fast = attention
-            .forward(&input(), None, &tables, &tables, None)
+            .forward(&input(), None, &tables, &tables, None, 1)
             .unwrap();
         assert_eq!(
             fast.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
@@ -640,7 +700,7 @@ mod singleton_tests {
         );
         let allowed = Tensor::ones((2, 1, 1, 1), DType::U8, &Device::Cpu).unwrap();
         let general = attention
-            .forward(&input(), Some(&allowed), &tables, &tables, None)
+            .forward(&input(), Some(&allowed), &tables, &tables, None, 1)
             .unwrap();
         assert_eq!(
             general.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
@@ -648,7 +708,7 @@ mod singleton_tests {
         );
         let blocked = Tensor::zeros((2, 1, 1, 1), DType::U8, &Device::Cpu).unwrap();
         let output = attention
-            .forward(&input(), Some(&blocked), &tables, &tables, None)
+            .forward(&input(), Some(&blocked), &tables, &tables, None, 1)
             .unwrap();
         assert!(output
             .flatten_all()
@@ -659,7 +719,7 @@ mod singleton_tests {
             .all(|v| *v == 0.0));
         let mut trace = BlockTrace::new();
         let traced = attention
-            .forward(&input(), None, &tables, &tables, Some(&mut trace))
+            .forward(&input(), None, &tables, &tables, Some(&mut trace), 1)
             .unwrap();
         assert_eq!(
             traced.flatten_all().unwrap().to_vec1::<f32>().unwrap(),

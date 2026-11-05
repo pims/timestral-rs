@@ -47,6 +47,33 @@ impl TimestralModel {
         self.head.forward(&decoder)
     }
 
+    pub(crate) fn normalized_quantiles_grouped(
+        &self,
+        tokens: &Tensor,
+        encoder_patches: usize,
+        positions: &Tensor,
+        masks: (&Tensor, Option<&Tensor>),
+        rows_per_group: usize,
+    ) -> Result<Tensor> {
+        let patches = tokens.dim(1)?;
+        ensure!(
+            encoder_patches > 0 && encoder_patches < patches,
+            "Invalid encoder split"
+        );
+        let hidden = self.transformer.forward_grouped(
+            tokens,
+            positions,
+            masks.0,
+            masks.1,
+            rows_per_group,
+        )?;
+        self.head.forward(
+            &hidden
+                .narrow(1, encoder_patches, patches - encoder_patches)?
+                .contiguous()?,
+        )
+    }
+
     /// Context-only single-block primitive for one target row. Context must be
     /// prepared, finite F32 [1, time], with a U8 [1, time] observation mask.
     /// Returns anchor-denormalized [1, forecast_steps, 21]; the forecaster refines it.

@@ -13,12 +13,12 @@ use candle_core::{Device, Module, Tensor};
 use std::collections::BTreeMap;
 
 #[derive(Clone)]
-struct Row {
-    role: RowRole,
-    values: Vec<f32>,
-    observed: Vec<bool>,
-    future: Vec<f32>,
-    future_observed: Vec<bool>,
+pub(crate) struct Row {
+    pub(crate) role: RowRole,
+    pub(crate) values: Vec<f32>,
+    pub(crate) observed: Vec<bool>,
+    pub(crate) future: Vec<f32>,
+    pub(crate) future_observed: Vec<bool>,
 }
 
 impl TimestralForecaster {
@@ -465,7 +465,7 @@ impl TimestralModel {
 
 /// Reference instance_norm_stats uses F32 population variance over the complete
 /// observed window. Binary known covariates keep loc=0, scale=1 and skip asinh.
-fn scale_known(
+pub(crate) fn scale_known(
     values: &[f32],
     observed: &[bool],
     minimum: f32,
@@ -586,7 +586,7 @@ fn reference_f32_sum(length: usize, value: impl Fn(usize) -> f32) -> f32 {
     total
 }
 
-fn prepare_rows(
+pub(crate) fn prepare_rows(
     history: &[f32],
     observed: &[bool],
     covariates: &Covariates,

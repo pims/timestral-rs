@@ -1,6 +1,7 @@
 //! Timestral-5M and Timestral-28M inference with Candle: original-unit univariate forecasting,
 //! checkpoint loading, time/variable transformer layers and a monotone quantile head.
 
+pub mod batch;
 pub mod categorical;
 pub mod config;
 mod covariate_forecast;
