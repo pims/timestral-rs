@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const DEFAULT_ATTENTION_ELEMENTS: usize = 8_388_608;
-/// Initial validated CPU release; matches the existing VPS forecast limit.
+/// Maximum currently validated covariate forecast horizon.
 pub const MAX_COVARIATE_HORIZON: usize = 256;
 
 #[derive(Clone, Copy, Debug, Serialize)]

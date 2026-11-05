@@ -19,4 +19,4 @@ cargo test --locked
 ```
 
 The fixtures record reference source hashes and numerical environment information.
-No server checkout or checkpoint weights are needed to regenerate them.
+Regeneration requires the pinned Python reference and does not require model weights.

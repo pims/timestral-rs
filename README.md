@@ -97,8 +97,10 @@ python3 scripts/compare_covariates.py /path/to/Timestral-28M --device metal
 ```
 
 The comparison accepts `--binary` for an explicit probe path; otherwise Cargo
-metadata locates the build output in either a standalone checkout or a workspace.
-Each model must report **32 complete-forecast cases passed**. HTTP validation and
-HTTP-versus-library tests remain in the separate server application.
+metadata locates the build output. Each model must report
+**32 complete-forecast cases passed**.
+
+Planned model capabilities and parity work are tracked in the
+[model improvements backlog](docs/model-improvements.md).
 
 Upstream implementation: https://github.com/mistralai/timestral

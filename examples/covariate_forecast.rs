@@ -9,8 +9,7 @@ use timestral_rs::{
     loading::load_model,
 };
 
-// Diagnostic transport only. HTTP deserialization and admission validation belong
-// to timestral-server; this probe constructs the public library input directly.
+// Diagnostic JSON transport for constructing public library inputs.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CovariatesInput {

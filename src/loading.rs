@@ -1,4 +1,4 @@
-//! Strict local loading. Network access is handled by scripts/download_model.py.
+//! Strict loading from local checkpoint directories.
 use crate::head::QuantileHead;
 use crate::transformer::Transformer;
 use crate::{
