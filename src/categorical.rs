@@ -121,8 +121,8 @@ fn numpy_target_sum(target: &[f32]) -> f64 {
         let mut lanes: [f64; 8] = std::array::from_fn(value);
         let aligned = target.len() / 8 * 8;
         for i in (8..aligned).step_by(8) {
-            for lane in 0..8 {
-                lanes[lane] += value(i + lane);
+            for (lane, accumulator) in lanes.iter_mut().enumerate() {
+                *accumulator += value(i + lane);
             }
         }
         let sum = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))

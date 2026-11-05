@@ -533,18 +533,21 @@ fn reference_f32_sum(length: usize, value: impl Fn(usize) -> f32) -> f32 {
     let step = 1usize << power;
     let mut sums = [[[0.0f32; 4]; 4]; 4];
     for group in 0..groups {
-        for partial in 0..4 {
-            for lane in 0..lanes {
-                sums[0][partial][lane] += value((group * 4 + partial) * lanes + lane);
+        for (partial, accumulators) in sums[0].iter_mut().enumerate() {
+            for (lane, accumulator) in accumulators.iter_mut().take(lanes).enumerate() {
+                *accumulator += value((group * 4 + partial) * lanes + lane);
             }
         }
         let completed = group + 1;
         if completed % step == 0 {
             for level in 1..4 {
-                for partial in 0..4 {
-                    for lane in 0..lanes {
-                        sums[level][partial][lane] += sums[level - 1][partial][lane];
-                        sums[level - 1][partial][lane] = 0.0;
+                let (lower_levels, higher_levels) = sums.split_at_mut(level);
+                let previous = &mut lower_levels[level - 1];
+                let current = &mut higher_levels[0];
+                for (destination, source) in current.iter_mut().zip(previous) {
+                    for (accumulator, value) in destination.iter_mut().zip(source).take(lanes) {
+                        *accumulator += *value;
+                        *value = 0.0;
                     }
                 }
                 if completed & ((step - 1) << (level as u32 * power)) != 0 {
@@ -553,29 +556,32 @@ fn reference_f32_sum(length: usize, value: impl Fn(usize) -> f32) -> f32 {
             }
         }
     }
-    for level in 1..4 {
-        for partial in 0..4 {
-            for lane in 0..lanes {
-                sums[0][partial][lane] += sums[level][partial][lane];
+    // Preserve the reference's level, partial, then lane accumulation order.
+    let (first_level, higher_levels) = sums.split_at_mut(1);
+    for level in higher_levels {
+        for (destination, source) in first_level[0].iter_mut().zip(level) {
+            for (accumulator, value) in destination.iter_mut().zip(source).take(lanes) {
+                *accumulator += *value;
             }
         }
     }
     for vector in groups * 4..vectors {
-        for lane in 0..lanes {
-            sums[0][0][lane] += value(vector * lanes + lane);
+        for (lane, accumulator) in sums[0][0].iter_mut().take(lanes).enumerate() {
+            *accumulator += value(vector * lanes + lane);
         }
     }
-    for partial in 1..4 {
-        for lane in 0..lanes {
-            sums[0][0][lane] += sums[0][partial][lane];
+    let (first_partial, remaining_partials) = sums[0].split_at_mut(1);
+    for partial in remaining_partials {
+        for (accumulator, value) in first_partial[0].iter_mut().zip(partial).take(lanes) {
+            *accumulator += *value;
         }
     }
     let mut total = 0.0f32;
     for i in vectors * lanes..length {
         total += value(i);
     }
-    for lane in 0..lanes {
-        total += sums[0][0][lane];
+    for &accumulator in sums[0][0].iter().take(lanes) {
+        total += accumulator;
     }
     total
 }
@@ -592,7 +598,7 @@ fn prepare_rows(
         .checked_add(patch_size - 1)
         .map(|n| n / patch_size * patch_size)
         .ok_or_else(|| anyhow::anyhow!("Horizon overflow"))?;
-    let (values, mask) = prepare_history(history, &observed, max_context, patch_size);
+    let (values, mask) = prepare_history(history, observed, max_context, patch_size);
     let mut rows = vec![Row {
         role: RowRole::Target,
         values,
