@@ -1,0 +1,7 @@
+/target/
+/models/
+/output/
+/*.npy
+/forecast*.csv
+**/__pycache__/
+.DS_Store
